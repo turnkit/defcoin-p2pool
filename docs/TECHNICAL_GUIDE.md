@@ -94,10 +94,17 @@ Common Defcoin operator ports:
 | Defcoin Core P2P | `1337` |
 | Defcoin Core RPC | `1335` |
 | Defcoin Core Nu backend P2P compatibility port on dc903 | `10332` |
-| P2Pool peer network | `1337` |
+| P2Pool peer network | `13370` |
 | Stratum worker port used by the public ASIC pool | `13372` |
 
 Operators should open only the ports required for their deployment.
+
+Do not run a public P2Pool peer listener on `1337` on a server that is also
+running a Defcoin Core node. Port `1337` is Defcoin Core's normal P2P node
+port, so binding P2Pool there prevents ordinary wallets and seeders from
+reaching the server's Core node on the expected default port. Use a separate
+P2Pool peer port such as `13370`, advertise it explicitly, and point P2Pool at
+the local Core node with `--bitcoind-p2p-port 1337`.
 
 ## Dual parent-chain magic
 
@@ -240,9 +247,11 @@ python run_p2pool.py \
   --net defcoin \
   --allow-obsolete-bitcoind \
   -a YOUR_DEFCOIN_OPERATOR_ADDRESS \
-  -n YOUR_PUBLIC_IP \
+  --p2pool-port 13370 \
+  --external-ip YOUR_PUBLIC_IP:13370 \
+  --worker-port 0.0.0.0:13372 \
   --bitcoind-address 127.0.0.1 \
-  --bitcoind-p2p-port 10332 \
+  --bitcoind-p2p-port 1337 \
   --fee 1.5
 ```
 
@@ -250,6 +259,10 @@ python run_p2pool.py \
 fee, applied by occasionally assigning worker shares to the operator address
 instead of the miner-submitted username address. This fee is separate from the
 legacy P2Pool developer donation script fixed by share version `36`.
+`--p2pool-port` is the P2Pool peer/share-network listener, `--external-ip`
+advertises that peer endpoint to other P2Pool nodes, and `--worker-port` is the
+miner stratum/status endpoint. Keep these separate from the local Defcoin Core
+P2P listener on `1337`.
 
 UPnP is disabled by default in this Defcoin fork. Use `--enable-upnp` only for
 consumer NAT deployments where automatic router port mapping is intentionally
