@@ -1,5 +1,14 @@
 var currency, currency_info, rate, local_stats, global_stats, current_payouts, recent_blocks, payout_addr;
 var local_hashrate = 0, local_doa_hashrate = 0;
+var currentGraphInterval = 'day';
+var graphIntervalLabels = {
+  hour: 'Hour',
+  day: 'Day',
+  week: 'Week',
+  month: 'Month',
+  year: 'Year',
+  twenty_years: '20 Years'
+};
 if (typeof config === 'undefined') {
   // Config couldn't be loaded, prefill with some basic defaults
   config = {
@@ -21,7 +30,10 @@ $(document).ready(function () {
   $(document).trigger('init');
 
   if (config.header_content_url && config.header_content_url.length > 0) {
-    $("#header_content").load(config.header_content_url);
+    var headerContentUrl = new URL(config.header_content_url, window.location.href);
+    if (headerContentUrl.origin === window.location.origin) {
+      $("#header_content").load(headerContentUrl.href);
+    }
   }
 });
 
@@ -41,10 +53,46 @@ $('#month.hashrate').click(function (e) {
 $('#year.hashrate').click(function (e) {
   fetchGraph('year');
 });
+$('#twenty_years.hashrate').click(function (e) {
+  fetchGraph('twenty_years');
+});
 
 $('#setminers.btn').click(function (e) {
   setMyMiners();
 });
+
+function formatMinerShareAge(lastSeenTs) {
+  var timestamp = parseFloat(lastSeenTs);
+  if (!isFinite(timestamp) || timestamp <= 0) {
+    return {
+      label: 'unknown',
+      seconds: 9999999999
+    };
+  }
+  var seconds = (new Date().getTime() / 1000) - timestamp;
+  if (!isFinite(seconds) || seconds < 0) {
+    seconds = 0;
+  }
+  seconds = Math.floor(seconds);
+  if (seconds >= 86400) {
+    var days = Math.floor(seconds / 86400);
+    return {
+      label: days + ' ' + (days === 1 ? 'Day' : 'Days'),
+      seconds: seconds
+    };
+  }
+
+  var hours = Math.floor(seconds / 3600);
+  var minutes = Math.floor((seconds % 3600) / 60);
+  var secs = seconds % 60;
+  var pad = function (value) {
+    return (value < 10 ? '0' : '') + value;
+  };
+  return {
+    label: pad(hours) + 'h' + pad(minutes) + 'm' + pad(secs) + 's',
+    seconds: seconds
+  };
+}
 
 // ==================================================================
 // custom event handlers
@@ -65,8 +113,7 @@ $(document).on('update', function (e, eventInfo) {
 });
 
 $(document).on('update_graph', function (e, eventInfo) {
-  graphPeriod = chart.title.text.match(/\((.+)\)/)[1] || 'day';
-  fetchGraph(graphPeriod);
+  fetchGraph(currentGraphInterval || 'day');
 });
 
 // Fills the list of active miners on this node.  I know, there are
@@ -76,8 +123,27 @@ $(document).on('update_miners', function (e, eventInfo) {
   local_hashrate = 0;
   local_doa_hashrate = 0;
 
-  // Sort by hashrate, highest first
-  miners = sortByValue(local_stats.miner_hash_rates).reverse();
+  minerHashRates = local_stats.miner_hash_rates || {};
+  minerLastSeenTimes = local_stats.miner_last_seen_times || {};
+  minerSet = {};
+  $.each(minerHashRates, function (address) {
+    minerSet[address] = true;
+  });
+  $.each(minerLastSeenTimes, function (address) {
+    minerSet[address] = true;
+  });
+  miners = [];
+  $.each(minerSet, function (address) {
+    miners.push(address);
+  });
+  miners.sort(function (left, right) {
+    var leftHashrate = parseFloat(minerHashRates[left] || 0);
+    var rightHashrate = parseFloat(minerHashRates[right] || 0);
+    if (leftHashrate !== rightHashrate) {
+      return rightHashrate - leftHashrate;
+    }
+    return parseFloat(minerLastSeenTimes[right] || 0) - parseFloat(minerLastSeenTimes[left] || 0);
+  });
   clientMiners = (localStorage.miners && localStorage.miners.length > 0) ? localStorage.miners.split("\n") : [];
 
   $('#active_miners').find("tr:gt(0)").remove();
@@ -87,7 +153,7 @@ $(document).on('update_miners', function (e, eventInfo) {
       return true;
     }
 
-    hashrate = local_stats.miner_hash_rates[address];
+    hashrate = minerHashRates[address] || 0;
     tr = $('<tr/>').attr('id', address);
 
     // Highlight client miner if configured
@@ -102,11 +168,13 @@ $(document).on('update_miners', function (e, eventInfo) {
     address_span = $('<span/>').addClass('coin_address').text(address);
     link_icon = $('<i/>').addClass('fa fa-external-link fa-fw');
     blockinfo = $('<a/>')
-      .attr('href', currency_info.address_explorer_url_prefix + address)
-      .attr('target', '_blank').append(link_icon);
+      .attr('href', currency_info.address_explorer_url_prefix + encodeURIComponent(address))
+      .attr('target', '_blank')
+      .attr('rel', 'noopener noreferrer')
+      .append(link_icon);
 
     doa = local_stats.miner_dead_hash_rates[address] || 0;
-    doa_prop = (parseFloat(doa) / parseFloat(hashrate)) * 100;
+    doa_prop = hashrate > 0 ? (parseFloat(doa) / parseFloat(hashrate)) * 100 : 0;
 
     local_hashrate += hashrate || 0;
     local_doa_hashrate += doa || 0;
@@ -155,6 +223,13 @@ $(document).on('update_miners', function (e, eventInfo) {
         .append(('' + time_to_share).formatSeconds())
       );
     }
+
+    shareAge = formatMinerShareAge(minerLastSeenTimes[address]);
+    tr.append($('<td/>')
+      .addClass('text-right')
+      .attr('data-value', shareAge.seconds)
+      .text(shareAge.label)
+    );
 
     payout = current_payouts[address] || 0;
 
@@ -264,7 +339,7 @@ $(document).on('update_miners', function (e, eventInfo) {
     $('#node_alerts').empty();
 
     $.each(local_stats.warnings, function (key, warning) {
-      $('#node_alerts').append($('<p/>').append(warning));
+      $('#node_alerts').append($('<p/>').text(warning));
     });
 
     $('#node_alerts').fadeIn(1000, function () {
@@ -308,8 +383,10 @@ $(document).on('update_blocks', function (e, eventInfo) {
 
     // link to blockchain.info for the given hash
     blockinfo = $('<a/>')
-      .attr('href', currency_info.block_explorer_url_prefix + hash)
-      .attr('target', '_blank').text(num);
+      .attr('href', currency_info.block_explorer_url_prefix + encodeURIComponent(hash))
+      .attr('target', '_blank')
+      .attr('rel', 'noopener noreferrer')
+      .text(num);
 
     tr = $('<tr/>').attr('id', num);
     tr.append($('<td/>').append($.format.prettyDate(new Date(ts * 1000))));
@@ -335,12 +412,14 @@ $(document).on('update_shares', function (e, eventInfo) {
 
     // link to blockchain.info for the given hash
     blockinfo = $('<a/>')
-      .attr('href', currency_info.block_explorer_url_prefix + hash)
-      .attr('target', '_blank').text(hash);
+      .attr('href', currency_info.block_explorer_url_prefix + encodeURIComponent(hash))
+      .attr('target', '_blank')
+      .attr('rel', 'noopener noreferrer')
+      .text(hash);
 
     tr = $('<tr/>').attr('id', num);
     tr.append($('<td/>').append($.format.prettyDate(new Date(ts * 1000))));
-    tr.append($('<td/>').append(num));
+    tr.append($('<td/>').text(num));
     tr.append($('<td/>').append(blockinfo));
     tr.append($('<td/>').html('&dash;'));
     $('#recent_blocks').append(tr);
@@ -356,7 +435,7 @@ $(document).on('update_currency', function (e, eventInfo) {
     currency = $('<i/>').attr('class', 'fa fa-btc fa-fw');
   }
   else {
-    currency = $('<span/>').append(currency_info.symbol);
+    currency = $('<span/>').text(currency_info.symbol);
   }
 
   if (set_currency_symbol) {
@@ -416,9 +495,10 @@ var fetchBlocks = function () {
 
 var fetchGraph = function (interval) {
   var graph_hashrate = [], graph_doa_hashrate = [], graph_blocks = [];
+  currentGraphInterval = interval || 'day';
 
   // Fetch Local Hashrates
-  $.getJSON(api_url + '/web/graph_data/local_hash_rate/last_' + interval, function (data) {
+  $.getJSON(api_url + '/web/graph_data/local_hash_rate/last_' + currentGraphInterval, function (data) {
     $.each(data, function (key, value) {
       el = [];
       el.push(parseInt(value[0]) * 1000, parseFloat(value[1]));
@@ -428,7 +508,7 @@ var fetchGraph = function (interval) {
     graph_hashrate.sort();
 
     // Fetch Local DOA Hashrates
-    $.getJSON(api_url + '/web/graph_data/local_dead_hash_rate/last_' + interval, function (data) {
+    $.getJSON(api_url + '/web/graph_data/local_dead_hash_rate/last_' + currentGraphInterval, function (data) {
       $.each(data, function (key, value) {
         el = [];
         el.push(parseInt(value[0]) * 1000, parseFloat(value[1]));
@@ -445,7 +525,7 @@ var fetchGraph = function (interval) {
           graph_blocks.push(el);
         });
 
-        draw(graph_hashrate, graph_doa_hashrate, graph_blocks, 'chart', interval);
+        draw(graph_hashrate, graph_doa_hashrate, graph_blocks, 'chart', graphIntervalLabels[currentGraphInterval] || currentGraphInterval);
       });
     });
   });

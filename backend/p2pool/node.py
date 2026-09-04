@@ -80,6 +80,10 @@ class P2PNode(p2p.Node):
             self.handle_shares([(share, []) for share in shares], peer)
     
     def handle_get_shares(self, hashes, parents, stops, peer):
+        if not hashes:
+            raise p2p.PeerMisbehavingError('empty share request')
+        if len(hashes) > 1000 or len(stops) > 1000:
+            raise p2p.PeerMisbehavingError('oversized share request')
         parents = min(parents, 1000//len(hashes))
         stops = set(stops)
         shares = []
@@ -319,13 +323,31 @@ class Node(object):
         if (self.cur_share_ver or 0) < 34:
             # forward transactions seen to bitcoind
             @self.known_txs_var.transitioned.watch
-            @defer.inlineCallbacks
             def _(before, after):
-                yield deferral.sleep(random.expovariate(1/1))
-                if self.factory.conn.value is None:
-                    return
-                for tx_hash in set(after) - set(before):
-                    self.factory.conn.value.send_tx(tx=after[tx_hash])
+                @defer.inlineCallbacks
+                def forward_transactions():
+                    yield deferral.sleep(random.expovariate(1/1))
+                    if self.factory.conn.value is None:
+                        return
+                    for tx_hash in set(after) - set(before):
+                        self.factory.conn.value.send_tx(tx=after[tx_hash])
+
+                forward_df = forward_transactions()
+                self._forward_transaction_dfs.add(forward_df)
+                forward_df.addErrback(
+                    lambda fail: fail.trap(defer.CancelledError))
+                forward_df.addBoth(
+                    lambda result: (
+                        self._forward_transaction_dfs.discard(forward_df),
+                        result,
+                    )[1])
+
+            self._forward_transaction_dfs = set()
+            def stop_forward_transactions():
+                for forward_df in list(self._forward_transaction_dfs):
+                    if not forward_df.called:
+                        forward_df.cancel()
+            stop_signal.watch(stop_forward_transactions)
         
         @self.tracker.verified.added.watch
         def _(share):

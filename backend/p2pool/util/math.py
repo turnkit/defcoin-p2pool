@@ -214,18 +214,21 @@ def string_to_natural(s, alphabet=None):
         return sum(alphabet.index(char) * len(alphabet)**i for i, char in enumerate(reversed(s)))
 
 class RateMonitor(object):
-    def __init__(self, max_lookback_time):
+    def __init__(self, max_lookback_time, max_len=None):
         self.max_lookback_time = max_lookback_time
+        self.max_len = max_len
         
         self.datums = []
         self.first_timestamp = None
     
     def _prune(self):
         start_time = time.time() - self.max_lookback_time
+        keep_from = len(self.datums)
         for i, (ts, datum) in enumerate(self.datums):
             if ts > start_time:
-                del self.datums[:i]
-                return
+                keep_from = i
+                break
+        del self.datums[:keep_from]
     
     def get_datums_in_last(self, dt=None):
         if dt is None:
@@ -242,6 +245,8 @@ class RateMonitor(object):
             self.first_timestamp = t
         else:
             self.datums.append((t, datum))
+            if self.max_len is not None and len(self.datums) > self.max_len:
+                del self.datums[:len(self.datums) - self.max_len]
 
 def merge_dicts(*dicts):
     res = {}

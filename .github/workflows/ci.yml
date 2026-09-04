@@ -38,7 +38,15 @@ jobs:
 
       - name: Unit tests
         working-directory: backend
-        run: python -m twisted.trial p2pool.test.test_data p2pool.test.test_node p2pool.test.bitcoin.test_data
+        run: |
+          python -m twisted.trial \
+            p2pool.test.test_data \
+            p2pool.test.test_node \
+            p2pool.test.bitcoin.test_data \
+            p2pool.test.test_http_security \
+            p2pool.test.test_security_limits \
+            p2pool.test.test_frontend_security \
+            p2pool.test.bitcoin.test_stratum_security
 
       - name: Python dependency audit
         run: |
@@ -57,5 +65,12 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      - name: JavaScript syntax checks
+        run: |
+          node --check frontend/web-static/js/config.js
+          node --check frontend/web-static/js/config.example.js
+          node --check frontend/web-static/js/util.js
+          node --check frontend/web-static/js/charts.js
+          node --check frontend/web-static/js/p2pool.js
       - name: Retire.js audit
         run: npx --yes retire --path frontend/web-static --outputformat text

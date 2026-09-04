@@ -122,6 +122,10 @@ address_type = pack.ComposedType([
 def is_segwit_tx(tx):
     return tx.get('marker', -1) == 0 and tx.get('flag', -1) >= 1
 
+MAX_TRANSACTION_VECTOR_ITEMS = 65536
+MAX_TRANSACTION_WITNESS_ITEMS = 65536
+MAX_MERKLE_BRANCH_ITEMS = 64
+
 tx_in_type = pack.ComposedType([
     ('previous_output', pack.PossiblyNoneType(dict(hash=0, index=2**32 - 1), pack.ComposedType([
         ('hash', pack.IntType(256)),
@@ -138,8 +142,10 @@ tx_out_type = pack.ComposedType([
 
 tx_id_type = pack.ComposedType([
     ('version', pack.IntType(32)),
-    ('tx_ins', pack.ListType(tx_in_type)),
-    ('tx_outs', pack.ListType(tx_out_type)),
+    ('tx_ins', pack.ListType(
+        tx_in_type, max_count=MAX_TRANSACTION_VECTOR_ITEMS)),
+    ('tx_outs', pack.ListType(
+        tx_out_type, max_count=MAX_TRANSACTION_VECTOR_ITEMS)),
     ('lock_time', pack.IntType(32))
 ])
 
@@ -155,22 +161,27 @@ def get_size(tx):
 class TransactionType(pack.Type):
     _int_type = pack.IntType(32)
     _varint_type = pack.VarIntType()
-    _witness_type = pack.ListType(pack.VarStrType())
+    _witness_item_type = pack.VarStrType()
     _wtx_type = pack.ComposedType([
         ('flag', pack.IntType(8)),
-        ('tx_ins', pack.ListType(tx_in_type)),
-        ('tx_outs', pack.ListType(tx_out_type))
+        ('tx_ins', pack.ListType(
+            tx_in_type, max_count=MAX_TRANSACTION_VECTOR_ITEMS)),
+        ('tx_outs', pack.ListType(
+            tx_out_type, max_count=MAX_TRANSACTION_VECTOR_ITEMS))
     ])
     _ntx_type = pack.ComposedType([
-        ('tx_outs', pack.ListType(tx_out_type)),
+        ('tx_outs', pack.ListType(
+            tx_out_type, max_count=MAX_TRANSACTION_VECTOR_ITEMS)),
         ('lock_time', _int_type)
     ])
     _write_type = pack.ComposedType([
         ('version', _int_type),
         ('marker', pack.IntType(8)),
         ('flag', pack.IntType(8)),
-        ('tx_ins', pack.ListType(tx_in_type)),
-        ('tx_outs', pack.ListType(tx_out_type))
+        ('tx_ins', pack.ListType(
+            tx_in_type, max_count=MAX_TRANSACTION_VECTOR_ITEMS)),
+        ('tx_outs', pack.ListType(
+            tx_out_type, max_count=MAX_TRANSACTION_VECTOR_ITEMS))
     ])
 
     def read(self, file):
@@ -179,11 +190,23 @@ class TransactionType(pack.Type):
         if marker == 0:
             next = self._wtx_type.read(file)
             witness = [None]*len(next['tx_ins'])
+            witness_items_remaining = MAX_TRANSACTION_WITNESS_ITEMS
             for i in range(len(next['tx_ins'])):
-                witness[i] = self._witness_type.read(file)
+                witness_count = self._varint_type.read(file)
+                if witness_count > witness_items_remaining:
+                    raise ValueError(
+                        'cumulative transaction witness item count too large')
+                pack.consume_list_items(file, witness_count)
+                witness_items_remaining -= witness_count
+                witness[i] = [
+                    self._witness_item_type.read(file)
+                    for unused in range(witness_count)]
             locktime = self._int_type.read(file)
             return dict(version=version, marker=marker, flag=next['flag'], tx_ins=next['tx_ins'], tx_outs=next['tx_outs'], witness=witness, lock_time=locktime)
         else:
+            if marker > MAX_TRANSACTION_VECTOR_ITEMS:
+                raise ValueError('transaction input count too large')
+            pack.consume_list_items(file, marker)
             tx_ins = [None]*marker
             for i in range(marker):
                 tx_ins[i] = tx_in_type.read(file)
@@ -193,9 +216,15 @@ class TransactionType(pack.Type):
     def write(self, file, item):
         if is_segwit_tx(item):
             assert len(item['tx_ins']) == len(item['witness'])
+            if sum(len(witness) for witness in item['witness']) > \
+                    MAX_TRANSACTION_WITNESS_ITEMS:
+                raise ValueError(
+                    'cumulative transaction witness item count too large')
             self._write_type.write(file, item)
             for w in item['witness']:
-                self._witness_type.write(file, w)
+                self._varint_type.write(file, len(w))
+                for witness_item in w:
+                    self._witness_item_type.write(file, witness_item)
             self._int_type.write(file, item['lock_time'])
             return
         return tx_id_type.write(file, item)
@@ -203,7 +232,8 @@ class TransactionType(pack.Type):
 tx_type = TransactionType()
 
 merkle_link_type = pack.ComposedType([
-    ('branch', pack.ListType(pack.IntType(256))),
+    ('branch', pack.ListType(
+        pack.IntType(256), max_count=MAX_MERKLE_BRANCH_ITEMS)),
     ('index', pack.IntType(32)),
 ])
 
@@ -224,12 +254,14 @@ block_header_type = pack.ComposedType([
 
 block_type = pack.ComposedType([
     ('header', block_header_type),
-    ('txs', pack.ListType(tx_type)),
+    ('txs', pack.ListType(
+        tx_type, max_count=MAX_TRANSACTION_VECTOR_ITEMS)),
 ])
 
 stripped_block_type = pack.ComposedType([
     ('header', block_header_type),
-    ('txs', pack.ListType(tx_id_type)),
+    ('txs', pack.ListType(
+        tx_id_type, max_count=MAX_TRANSACTION_VECTOR_ITEMS)),
 ])
 
 # merged mining

@@ -22,32 +22,32 @@ static PyObject *scrypt_getpowhash(PyObject *self, PyObject *args, PyObject* kwa
 {
     char *input;
     Py_ssize_t inputlen;
-    char *outbuf;
-    PyObject *value = NULL;
+    char outbuf[32];
 
     static char *g2_kwlist[] = {"input", NULL};
+
+    (void)self;
 
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y#", g2_kwlist,
                                      &input, &inputlen)) {
         return NULL;
     }
 
-    outbuf = PyMem_Malloc(32);
-    if (outbuf == NULL) {
-        return PyErr_NoMemory();
+    if (inputlen != 80) {
+        PyErr_SetString(PyExc_ValueError,
+                        "scrypt input must be exactly 80 bytes");
+        return NULL;
     }
 
     Py_BEGIN_ALLOW_THREADS;
     scrypt_1024_1_1_256(input, outbuf);
     Py_END_ALLOW_THREADS;
 
-    value = Py_BuildValue("y#", outbuf, 32);
-    PyMem_Free(outbuf);
-    return value;
+    return PyBytes_FromStringAndSize(outbuf, sizeof(outbuf));
 }
 
 static PyMethodDef ScryptMethods[] = {
-    { "getPoWHash", (PyCFunction) scrypt_getpowhash, METH_VARARGS | METH_KEYWORDS, "Returns the proof of work hash using scrypt" },
+    { "getPoWHash", _PyCFunction_CAST(scrypt_getpowhash), METH_VARARGS | METH_KEYWORDS, "Returns the proof of work hash using scrypt" },
     { NULL, NULL, 0, NULL }
 };
 
@@ -56,7 +56,11 @@ static struct PyModuleDef scryptmodule = {
     "ltc_scrypt",
     NULL,
     -1,
-    ScryptMethods
+    ScryptMethods,
+    NULL,
+    NULL,
+    NULL,
+    NULL
 };
 
 PyMODINIT_FUNC PyInit_ltc_scrypt(void) {

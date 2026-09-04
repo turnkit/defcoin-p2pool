@@ -1,5 +1,6 @@
 
 
+import collections
 import math
 import random
 import secrets
@@ -16,12 +17,24 @@ from p2pool.util import deferral, p2protocol, pack, variable
 from p2pool.util.py3 import ensure_bytes
 
 _HANDSHAKE_LOG_INTERVAL = 300
-_HANDSHAKE_LOG_STATE = {}
+_HANDSHAKE_LOG_MAX_IDENTITIES = 4096
+_HANDSHAKE_LOG_STATE = collections.OrderedDict()
+MAX_PEER_PENALTY_IDENTITIES = 4096
+MAX_PEER_ADDRESSES_PER_MESSAGE = 100
+MAX_SHARE_REQUEST_ITEMS = 1000
+# A request for 1,000 independent heads may include each head plus one parent.
+MAX_SHARES_PER_MESSAGE = 2000
+MAX_TRANSACTION_ITEMS_PER_MESSAGE = 10000
 
 def _rate_limited_handshake_log(kind, host, message, interval=_HANDSHAKE_LOG_INTERVAL):
     now = time.time()
     key = kind, host
-    last, suppressed = _HANDSHAKE_LOG_STATE.get(key, (0, 0))
+    if key in _HANDSHAKE_LOG_STATE:
+        last, suppressed = _HANDSHAKE_LOG_STATE.pop(key)
+    else:
+        last, suppressed = 0, 0
+        if len(_HANDSHAKE_LOG_STATE) >= _HANDSHAKE_LOG_MAX_IDENTITIES:
+            _HANDSHAKE_LOG_STATE.popitem(last=False)
     if now - last >= interval:
         if suppressed:
             elapsed = max(1, now - last)
@@ -36,12 +49,22 @@ class PeerMisbehavingError(Exception):
     pass
 
 
-def fragment(f, **kwargs):
+def fragment(f, max_items=None, **kwargs):
+    if max_items is not None:
+        largest = max([0] + [len(value) for value in kwargs.values()])
+        if largest > max_items:
+            for start in range(0, largest, max_items):
+                fragment(f, max_items=max_items, **dict(
+                    (key, value[start:start + max_items])
+                    for key, value in kwargs.items()))
+            return
     try:
         f(**kwargs)
     except p2protocol.TooLong:
-        fragment(f, **dict((k, v[:len(v)//2]) for k, v in kwargs.items()))
-        fragment(f, **dict((k, v[len(v)//2:]) for k, v in kwargs.items()))
+        fragment(f, max_items=max_items, **dict(
+            (k, v[:len(v)//2]) for k, v in kwargs.items()))
+        fragment(f, max_items=max_items, **dict(
+            (k, v[len(v)//2:]) for k, v in kwargs.items()))
 
 class Protocol(p2protocol.Protocol):
     VERSION = 3501
@@ -121,11 +144,7 @@ class Protocol(p2protocol.Protocol):
         self.disconnect()
         if self.transport.getPeer().host != '127.0.0.1': # never ban localhost
             host = self.transport.getPeer().host
-            if not host in self.node.banscores:
-                self.node.banscores[host] = 1
-            else:
-                self.node.banscores[host] += 1
-            self.node.bans[self.transport.getPeer().host] = time.time() + bantime * self.node.banscores[host]**2
+            self.node.penalize_peer(host, bantime)
     
     def _timeout(self):
         self.timeout_delayed = None
@@ -244,14 +263,20 @@ class Protocol(p2protocol.Protocol):
 
         def add_to_remote_view_of_my_known_txs(added):
             if added:
-                self.send_have_tx(tx_hashes=list(added.keys()))
+                fragment(
+                    self.send_have_tx,
+                    max_items=MAX_TRANSACTION_ITEMS_PER_MESSAGE,
+                    tx_hashes=list(added.keys()))
         
         watch_id0 = self.node.known_txs_var.added.watch(add_to_remote_view_of_my_known_txs)
         self.connection_lost_event.watch(lambda: self.node.known_txs_var.added.unwatch(watch_id0))
         
         def remove_from_remote_view_of_my_known_txs(removed):
             if removed:
-                self.send_losing_tx(tx_hashes=list(removed.keys()))
+                fragment(
+                    self.send_losing_tx,
+                    max_items=MAX_TRANSACTION_ITEMS_PER_MESSAGE,
+                    tx_hashes=list(removed.keys()))
                 
                 # cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
                 key = max(self.known_txs_cache) + 1 if self.known_txs_cache else 0
@@ -266,9 +291,15 @@ class Protocol(p2protocol.Protocol):
             added = set(after) - set(before)
             removed = set(before) - set(after)
             if added:
-                self.send_have_tx(tx_hashes=list(added))
+                fragment(
+                    self.send_have_tx,
+                    max_items=MAX_TRANSACTION_ITEMS_PER_MESSAGE,
+                    tx_hashes=list(added))
             if removed:
-                self.send_losing_tx(tx_hashes=list(removed))
+                fragment(
+                    self.send_losing_tx,
+                    max_items=MAX_TRANSACTION_ITEMS_PER_MESSAGE,
+                    tx_hashes=list(removed))
                 
                 # cache forgotten txs here for a little while so latency of "losing_tx" packets doesn't cause problems
                 key = max(self.known_txs_cache) + 1 if self.known_txs_cache else 0
@@ -280,19 +311,31 @@ class Protocol(p2protocol.Protocol):
         watch_id2 = self.node.known_txs_var.transitioned.watch(update_remote_view_of_my_known_txs)
         self.connection_lost_event.watch(lambda: self.node.known_txs_var.transitioned.unwatch(watch_id2))
         
-        self.send_have_tx(tx_hashes=list(self.node.known_txs_var.value.keys()))
+        fragment(
+            self.send_have_tx,
+            max_items=MAX_TRANSACTION_ITEMS_PER_MESSAGE,
+            tx_hashes=list(self.node.known_txs_var.value.keys()))
         
         def update_remote_view_of_my_mining_txs(before, after):
             t0 = time.time()
             added = set(after) - set(before)
             removed = set(before) - set(after)
             if removed:
-                self.send_forget_tx(tx_hashes=list(removed))
+                fragment(
+                    self.send_forget_tx,
+                    max_items=MAX_TRANSACTION_ITEMS_PER_MESSAGE,
+                    tx_hashes=list(removed))
                 self.remote_remembered_txs_size -= sum(100 + bitcoin_data.tx_type.packed_size(before[x]) for x in removed)
             if added:
                 self.remote_remembered_txs_size += sum(100 + bitcoin_data.tx_type.packed_size(after[x]) for x in added)
                 assert self.remote_remembered_txs_size <= self.max_remembered_txs_size
-                fragment(self.send_remember_tx, tx_hashes=[x for x in added if x in self.remote_tx_hashes], txs=[after[x] for x in added if x not in self.remote_tx_hashes])
+                fragment(
+                    self.send_remember_tx,
+                    max_items=MAX_TRANSACTION_ITEMS_PER_MESSAGE,
+                    tx_hashes=[x for x in added
+                               if x in self.remote_tx_hashes],
+                    txs=[after[x] for x in added
+                         if x not in self.remote_tx_hashes])
             t1 = time.time()
             if p2pool.BENCH and (t1-t0) > .01: print("%8.3f ms for update_remote_view_of_my_mining_txs" % ((t1-t0)*1000.))
 
@@ -301,7 +344,11 @@ class Protocol(p2protocol.Protocol):
         
         self.remote_remembered_txs_size += sum(100 + bitcoin_data.tx_type.packed_size(x) for x in list(self.node.mining_txs_var.value.values()))
         assert self.remote_remembered_txs_size <= self.max_remembered_txs_size
-        fragment(self.send_remember_tx, tx_hashes=[], txs=list(self.node.mining_txs_var.value.values()))
+        fragment(
+            self.send_remember_tx,
+            max_items=MAX_TRANSACTION_ITEMS_PER_MESSAGE,
+            tx_hashes=[],
+            txs=list(self.node.mining_txs_var.value.values()))
     
     message_ping = pack.ComposedType([])
     def handle_ping(self):
@@ -334,9 +381,11 @@ class Protocol(p2protocol.Protocol):
         ('addrs', pack.ListType(pack.ComposedType([
             ('timestamp', pack.IntType(64)),
             ('address', bitcoin_data.address_type),
-        ]))),
+        ]), max_count=MAX_PEER_ADDRESSES_PER_MESSAGE)),
     ])
     def handle_addrs(self, addrs):
+        if len(addrs) > 100:
+            raise PeerMisbehavingError('too many peer addresses')
         for addr_record in addrs:
             self.node.got_addr((addr_record['address']['address'], addr_record['address']['port']), addr_record['address']['services'], min(int(time.time()), addr_record['timestamp']))
             if random.random() < .8 and self.node.peers:
@@ -361,7 +410,8 @@ class Protocol(p2protocol.Protocol):
         ])
     
     message_shares = pack.ComposedType([
-        ('shares', pack.ListType(p2pool_data.share_type)),
+        ('shares', pack.ListType(
+            p2pool_data.share_type, max_count=MAX_SHARES_PER_MESSAGE)),
     ])
     def handle_shares(self, shares):
         t0 = time.time()
@@ -436,12 +486,21 @@ class Protocol(p2protocol.Protocol):
                 raise ValueError('shares have too many txs')
             self.remote_remembered_txs_size = new_remote_remembered_txs_size
 
-            fragment(self.send_remember_tx, tx_hashes=[x for x in hashes_to_send if x in self.remote_tx_hashes], txs=[known_txs[x] for x in hashes_to_send if x not in self.remote_tx_hashes])
+            fragment(
+                self.send_remember_tx,
+                max_items=MAX_TRANSACTION_ITEMS_PER_MESSAGE,
+                tx_hashes=[x for x in hashes_to_send
+                           if x in self.remote_tx_hashes],
+                txs=[known_txs[x] for x in hashes_to_send
+                     if x not in self.remote_tx_hashes])
 
         fragment(self.send_shares, shares=[share.as_share() for share in shares])
 
         if hashes_to_send:
-            self.send_forget_tx(tx_hashes=hashes_to_send)
+            fragment(
+                self.send_forget_tx,
+                max_items=MAX_TRANSACTION_ITEMS_PER_MESSAGE,
+                tx_hashes=hashes_to_send)
 
             self.remote_remembered_txs_size -= new_tx_size
         t1 = time.time()
@@ -451,9 +510,11 @@ class Protocol(p2protocol.Protocol):
     
     message_sharereq = pack.ComposedType([
         ('id', pack.IntType(256)),
-        ('hashes', pack.ListType(pack.IntType(256))),
+        ('hashes', pack.ListType(
+            pack.IntType(256), max_count=MAX_SHARE_REQUEST_ITEMS)),
         ('parents', pack.VarIntType()),
-        ('stops', pack.ListType(pack.IntType(256))),
+        ('stops', pack.ListType(
+            pack.IntType(256), max_count=MAX_SHARE_REQUEST_ITEMS)),
     ])
     def handle_sharereq(self, id, hashes, parents, stops):
         shares = self.node.handle_get_shares(hashes, parents, stops, self)
@@ -465,7 +526,8 @@ class Protocol(p2protocol.Protocol):
     message_sharereply = pack.ComposedType([
         ('id', pack.IntType(256)),
         ('result', pack.EnumType(pack.VarIntType(), {0: 'good', 1: 'too long', 2: 'unk2', 3: 'unk3', 4: 'unk4', 5: 'unk5', 6: 'unk6'})),
-        ('shares', pack.ListType(p2pool_data.share_type)),
+        ('shares', pack.ListType(
+            p2pool_data.share_type, max_count=MAX_SHARES_PER_MESSAGE)),
     ])
     class ShareReplyError(Exception): pass
     def handle_sharereply(self, id, result, shares):
@@ -484,7 +546,9 @@ class Protocol(p2protocol.Protocol):
     
     
     message_have_tx = pack.ComposedType([
-        ('tx_hashes', pack.ListType(pack.IntType(256))),
+        ('tx_hashes', pack.ListType(
+            pack.IntType(256),
+            max_count=MAX_TRANSACTION_ITEMS_PER_MESSAGE)),
     ])
     def handle_have_tx(self, tx_hashes):
         #assert self.remote_tx_hashes.isdisjoint(tx_hashes)
@@ -492,7 +556,9 @@ class Protocol(p2protocol.Protocol):
         while len(self.remote_tx_hashes) > 10000:
             self.remote_tx_hashes.pop()
     message_losing_tx = pack.ComposedType([
-        ('tx_hashes', pack.ListType(pack.IntType(256))),
+        ('tx_hashes', pack.ListType(
+            pack.IntType(256),
+            max_count=MAX_TRANSACTION_ITEMS_PER_MESSAGE)),
     ])
     def handle_losing_tx(self, tx_hashes):
         t0 = time.time()
@@ -504,8 +570,12 @@ class Protocol(p2protocol.Protocol):
     
     
     message_remember_tx = pack.ComposedType([
-        ('tx_hashes', pack.ListType(pack.IntType(256))),
-        ('txs', pack.ListType(bitcoin_data.tx_type)),
+        ('tx_hashes', pack.ListType(
+            pack.IntType(256),
+            max_count=MAX_TRANSACTION_ITEMS_PER_MESSAGE)),
+        ('txs', pack.ListType(
+            bitcoin_data.tx_type,
+            max_count=MAX_TRANSACTION_ITEMS_PER_MESSAGE)),
     ])
     def handle_remember_tx(self, tx_hashes, txs):
         t0 = time.time()
@@ -552,7 +622,9 @@ class Protocol(p2protocol.Protocol):
         t1 = time.time()
         if p2pool.BENCH and (t1-t0) > .01: print("%8.3f ms for %i txs in p2p.py:handle_remember_tx (%3.3f ms/tx)" % ((t1-t0)*1000., len(tx_hashes), ((t1-t0)*1000. / max(1,len(tx_hashes)) )))
     message_forget_tx = pack.ComposedType([
-        ('tx_hashes', pack.ListType(pack.IntType(256))),
+        ('tx_hashes', pack.ListType(
+            pack.IntType(256),
+            max_count=MAX_TRANSACTION_ITEMS_PER_MESSAGE)),
     ])
     def handle_forget_tx(self, tx_hashes):
         for tx_hash in tx_hashes:
@@ -757,8 +829,8 @@ class Node(object):
         self.traffic_happened = variable.Event()
         self.nonce = secrets.randbits(64)
         self.peers = {}
-        self.bans = {} # address -> end_time
-        self.banscores = {} # address -> how naughty this peer has been recently
+        self.bans = collections.OrderedDict() # address -> end_time
+        self.banscores = collections.OrderedDict() # address -> recent score
         self.clientfactory = ClientFactory(self, desired_outgoing_conns, max_outgoing_attempts)
         self.serverfactory = ServerFactory(self, max_incoming_conns)
         self.running = False
@@ -777,11 +849,37 @@ class Node(object):
         self.forgiveness_task = task.LoopingCall(self.forgive_transgressions)
         self.forgiveness_task.start(3600.)
 
+    def _prune_peer_penalties(self, now=None):
+        if now is None:
+            now = time.time()
+        for host, end_time in list(self.bans.items()):
+            if end_time <= now:
+                del self.bans[host]
+        for host, score in list(self.banscores.items()):
+            if score <= 0 and host not in self.bans:
+                del self.banscores[host]
+
+    def penalize_peer(self, host, bantime=3600, now=None):
+        if now is None:
+            now = time.time()
+        self._prune_peer_penalties(now)
+        if host in self.banscores:
+            score = self.banscores.pop(host) + 1
+        elif len(self.banscores) < MAX_PEER_PENALTY_IDENTITIES:
+            score = 1
+        else:
+            return False
+        self.banscores[host] = score
+        self.bans.pop(host, None)
+        self.bans[host] = now + bantime * score**2
+        return True
+
     def forgive_transgressions(self):
-        for host in self.banscores:
+        now = time.time()
+        self._prune_peer_penalties(now)
+        for host in list(self.banscores):
             self.banscores[host] -= 1
-            if self.banscores[host] < 0:
-                self.banscores[host] = 0
+        self._prune_peer_penalties(now)
     
     def _think(self):
         try:

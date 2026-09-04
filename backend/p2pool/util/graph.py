@@ -113,6 +113,29 @@ class HistoryDatabase(object):
             if not isinstance(total, dict):
                 total = {'null': total}
             return dict((k, (v, count)) for k, v in total.items()) if count else {}
+        def new_dataview(ds_name, ds_desc, dv_name, dv_desc):
+            if ds_desc.default_func is None:
+                return DataView(dv_desc, ds_desc, 0, dv_desc.bin_count*[{}])
+            return ds_desc.default_func(
+                ds_name, ds_desc, dv_name, dv_desc, obj)
+        def resize_dataview(ds_desc, dv_desc, dv_data):
+            old_bin_width = dv_data.get('bin_width')
+            old_last_bin_end = dv_data.get('last_bin_end')
+            old_bins = dv_data.get('bins')
+            if not old_bin_width or old_last_bin_end is None or not old_bins:
+                return None
+            bins = dv_desc.bin_count*[{}]
+            for i, old_bin in enumerate(map(convert_bin, old_bins)):
+                if not old_bin:
+                    continue
+                center = old_last_bin_end - old_bin_width*(i + 0.5)
+                new_bin = int(math.floor(
+                    (old_last_bin_end - center)/dv_desc.bin_width))
+                if 0 <= new_bin < dv_desc.bin_count:
+                    bins[new_bin] = ds_desc.keep_largest_func(
+                        combine_bins(bins[new_bin], old_bin))
+            return DataView(
+                dv_desc, ds_desc, old_last_bin_end, bins)
         def get_dataview(ds_name, ds_desc, dv_name, dv_desc):
             if ds_name in obj:
                 ds_data = obj[ds_name]
@@ -120,10 +143,15 @@ class HistoryDatabase(object):
                     dv_data = ds_data[dv_name]
                     if dv_data['bin_width'] == dv_desc.bin_width and len(dv_data['bins']) == dv_desc.bin_count:
                         return DataView(dv_desc, ds_desc, dv_data['last_bin_end'], list(map(convert_bin, dv_data['bins'])))
-            elif ds_desc.default_func is None:
-                return DataView(dv_desc, ds_desc, 0, dv_desc.bin_count*[{}])
-            else:
-                return ds_desc.default_func(ds_name, ds_desc, dv_name, dv_desc, obj)
+                    resized = resize_dataview(ds_desc, dv_desc, dv_data)
+                    if resized is not None:
+                        return resized
+                if dv_name == 'last_twenty_years' and 'last_year' in ds_data:
+                    resized = resize_dataview(
+                        ds_desc, dv_desc, ds_data['last_year'])
+                    if resized is not None:
+                        return resized
+            return new_dataview(ds_name, ds_desc, dv_name, dv_desc)
         return cls(dict(
             (ds_name, DataStream(ds_desc, dict(
                 (dv_name, get_dataview(ds_name, ds_desc, dv_name, dv_desc))
@@ -141,16 +169,64 @@ class HistoryDatabase(object):
 
 
 def make_multivalue_migrator(multivalue_keys, post_func=lambda bins: bins):
+    def get_source_view(source, dv_name):
+        source_view = source.get(dv_name)
+        if source_view is None and dv_name == 'last_twenty_years':
+            return source.get('last_year')
+        return source_view
+
+    def resize_source_view(source_view, dv_desc, last_bin_end):
+        if source_view is None:
+            return dict(last_bin_end=0, bins=dv_desc.bin_count*[{}])
+
+        old_bins = source_view.get('bins')
+        old_bin_width = source_view.get('bin_width')
+        old_last_bin_end = source_view.get('last_bin_end')
+        if (not old_bins or not old_bin_width or
+                old_last_bin_end is None):
+            return dict(last_bin_end=0, bins=dv_desc.bin_count*[{}])
+
+        bins = dv_desc.bin_count*[{}]
+        for i, old_bin in enumerate(old_bins):
+            if isinstance(old_bin, dict):
+                value = old_bin.get('null')
+            else:
+                total, count = old_bin
+                value = (total.get('null') if isinstance(total, dict)
+                         else total, count)
+            if value is None:
+                continue
+            center = old_last_bin_end - old_bin_width*(i + 0.5)
+            new_bin = int(math.floor(
+                (last_bin_end - center)/dv_desc.bin_width))
+            if 0 <= new_bin < dv_desc.bin_count:
+                previous = bins[new_bin].get('null', (0, 0))
+                bins[new_bin] = {
+                    'null': (previous[0] + value[0],
+                             previous[1] + value[1]),
+                }
+        return dict(last_bin_end=last_bin_end, bins=bins)
+
     def _(ds_name, ds_desc, dv_name, dv_desc, obj):
         if not obj:
             last_bin_end = 0
             bins = dv_desc.bin_count*[{}]
         else:
-            inputs = dict((k, obj.get(v, {dv_name: dict(bins=[{}]*dv_desc.bin_count, last_bin_end=0)})[dv_name]) for k, v in multivalue_keys.items())
-            last_bin_end = max(inp['last_bin_end'] for inp in inputs.values()) if inputs else 0
-            assert all(len(inp['bins']) == dv_desc.bin_count for inp in inputs.values())
-            inputs = dict((k, dict(list(zip(['bins', 'last_bin_end'], _shift_bins_so_t_is_not_past_end(v['bins'], v['last_bin_end'], dv_desc.bin_width, last_bin_end))))) for k, v in inputs.items())
-            assert len(set(inp['last_bin_end'] for inp in inputs.values())) <= 1
+            source_views = dict(
+                (key, get_source_view(
+                    obj.get(source_name, {}), dv_name))
+                for key, source_name in multivalue_keys.items())
+            last_bin_end = max(
+                [0] + [view.get('last_bin_end', 0)
+                       for view in source_views.values()
+                       if view is not None])
+            if last_bin_end:
+                last_bin_end = (math.ceil(
+                    last_bin_end/dv_desc.bin_width) * dv_desc.bin_width)
+            inputs = dict(
+                (key, resize_source_view(
+                    source_view, dv_desc, last_bin_end))
+                for key, source_view in source_views.items())
             bins = post_func([dict((k, v['bins'][i]['null']) for k, v in inputs.items() if 'null' in v['bins'][i]) for i in range(dv_desc.bin_count)])
         return DataView(dv_desc, ds_desc, last_bin_end, bins)
     return _

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/defcoin-p2pool-hero.svg" alt="Defcoin P2Pool decentralized mining infrastructure" width="900">
+  <img src="docs/assets/defcoin-v26-coin.png" alt="Official high-resolution Defcoin coin" width="600">
 </p>
 
 # Defcoin P2Pool

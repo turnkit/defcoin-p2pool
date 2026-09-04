@@ -184,9 +184,10 @@ class MiniNode(object):
     def stop(self):
         yield self.web_port.stopListening()
         self.worker_interface.stop()
+        self.wb.stop()
         yield self.n.p2p_node.stop()
         yield self.n.stop()
-        del self.web_port, self.worker_interface, self.n
+        del self.web_port, self.worker_interface, self.wb, self.n
 
 class Test(unittest.TestCase):
     @defer.inlineCallbacks

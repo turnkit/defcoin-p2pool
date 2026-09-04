@@ -98,9 +98,10 @@ class LinkedList(object):
 
 
 class ExpiringDict(object):
-    def __init__(self, expiry_time, get_touches=True):
+    def __init__(self, expiry_time, get_touches=True, max_len=None):
         self.expiry_time = expiry_time
         self.get_touches = get_touches
+        self.max_len = max_len
         
         self.expiry_deque = LinkedList()
         self.d = dict() # key -> node, value
@@ -124,6 +125,9 @@ class ExpiringDict(object):
         if value is self._nothing or key in self.d:
             node, old_value = self.d[key]
             node.delete()
+        elif self.max_len is not None and len(self.d) >= self.max_len:
+            timestamp, expired_key = self.expiry_deque.popleft()
+            del self.d[expired_key]
         
         new_value = old_value if value is self._nothing else value
         self.d[key] = self.expiry_deque.append((time.time() + self.expiry_time, key)), new_value
@@ -171,6 +175,9 @@ class ExpiringDict(object):
     
     def keys(self):
         return list(self.d.keys())
+
+    def items(self):
+        return [(key, value) for key, (node, value) in self.d.items()]
     
     def values(self):
         return [value for node, value in self.d.values()]

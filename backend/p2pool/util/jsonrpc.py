@@ -7,11 +7,58 @@ import weakref
 from twisted.internet import defer, reactor
 from twisted.protocols import basic
 from twisted.python import failure, log
-from twisted.web import client, error
+from twisted.web import client, error, http, server
 from twisted.web.http_headers import Headers
 
 from p2pool.util import deferral, deferred_resource, memoize
 from p2pool.util.py3 import ensure_bytes, ensure_text
+
+MAX_HTTP_JSON_REQUEST_SIZE = 64*1024
+MAX_STRATUM_LINE_SIZE = 16*1024
+
+class SizeLimitedHTTPChannel(http.HTTPChannel):
+    max_request_body_size = MAX_HTTP_JSON_REQUEST_SIZE
+
+    def __init__(self):
+        http.HTTPChannel.__init__(self)
+        self._body_rejected = False
+
+    def _reject_request_entity_too_large(self):
+        if self._body_rejected:
+            return
+        self._body_rejected = True
+        self.persistent = False
+        self.transport.write(
+            b'HTTP/1.1 413 Payload Too Large\r\n'
+            b'Connection: close\r\n'
+            b'Content-Length: 0\r\n\r\n')
+        self.loseConnection()
+
+    def allHeadersReceived(self):
+        if (self.length is not None and
+                self.length > self.max_request_body_size):
+            self._reject_request_entity_too_large()
+            return
+        return http.HTTPChannel.allHeadersReceived(self)
+
+    def _finishRequestBody(self, data):
+        if self._body_rejected:
+            return
+        return http.HTTPChannel._finishRequestBody(self, data)
+
+class SizeLimitedRequest(server.Request):
+    def gotLength(self, length):
+        self._body_bytes_received = 0
+        return server.Request.gotLength(self, length)
+
+    def handleContentChunk(self, data):
+        if self.channel._body_rejected:
+            return
+        self._body_bytes_received += len(data)
+        if self._body_bytes_received > self.channel.max_request_body_size:
+            self.channel._reject_request_entity_too_large()
+            return
+        return server.Request.handleContentChunk(self, data)
 
 class Error(Exception):
     def __init__(self, code, message, data=None):
@@ -62,8 +109,12 @@ def _handle(data, provider, preargs=(), response_handler=None):
                     req = json.loads(data)
                 except Exception:
                     raise Error_for_code(-32700)('Parse error')
+                if not isinstance(req, dict):
+                    raise Error_for_code(-32600)('Invalid Request')
                 
                 if 'result' in req or 'error' in req:
+                    if response_handler is None:
+                        raise Error_for_code(-32600)('Invalid Request')
                     response_handler(req['id'], req['result'] if 'error' not in req or req['error'] is None else
                         failure.Failure(Error_for_code(req['error']['code'])(req['error']['message'], req['error'].get('data', None))))
                     defer.returnValue(None)
@@ -151,15 +202,47 @@ class HTTPServer(deferred_resource.DeferredResource):
     
     @defer.inlineCallbacks
     def render_POST(self, request):
-        data = yield _handle(request.content.read(), self._provider, preargs=[request])
+        request.setHeader('X-Content-Type-Options', 'nosniff')
+        request.setHeader('Referrer-Policy', 'no-referrer')
+        request.setHeader('X-Frame-Options', 'DENY')
+
+        content_length = request.getHeader('Content-Length')
+        if content_length is not None:
+            try:
+                content_length = int(content_length)
+            except (TypeError, ValueError):
+                self._reject_request(request, 400, 'Invalid Content-Length')
+                defer.returnValue(None)
+            if content_length < 0:
+                self._reject_request(request, 400, 'Invalid Content-Length')
+                defer.returnValue(None)
+            if content_length > MAX_HTTP_JSON_REQUEST_SIZE:
+                self._reject_request(request, 413, 'JSON-RPC request too large')
+                defer.returnValue(None)
+
+        request_body = request.content.read(MAX_HTTP_JSON_REQUEST_SIZE + 1)
+        if len(request_body) > MAX_HTTP_JSON_REQUEST_SIZE:
+            self._reject_request(request, 413, 'JSON-RPC request too large')
+            defer.returnValue(None)
+
+        data = yield _handle(request_body, self._provider, preargs=[request])
         assert data is not None
         request.setHeader('Content-Type', 'application/json')
         data = ensure_bytes(data, 'utf-8')
         request.setHeader('Content-Length', str(len(data)))
         request.write(data)
 
+    def _reject_request(self, request, status, message):
+        body = ensure_bytes(message, 'utf-8')
+        request.setResponseCode(status)
+        request.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        request.setHeader('Content-Length', str(len(body)))
+        request.setHeader('Connection', 'close')
+        request.write(body)
+
 class LineBasedPeer(basic.LineOnlyReceiver):
     delimiter = b'\n'
+    MAX_LENGTH = MAX_STRATUM_LINE_SIZE
     
     def __init__(self):
         #basic.LineOnlyReceiver.__init__(self)

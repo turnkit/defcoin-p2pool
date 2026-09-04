@@ -18,6 +18,20 @@ from . import data as p2pool_data, p2p
 from .util import deferral, deferred_resource, graph, math, memory, pack, variable
 from .util.py3 import bytes_to_hex, ensure_bytes
 
+PINGS_CACHE_SECONDS = 30
+
+def _set_browser_security_headers(request):
+    request.setHeader('X-Content-Type-Options', 'nosniff')
+    request.setHeader('Referrer-Policy', 'no-referrer')
+    request.setHeader('X-Frame-Options', 'DENY')
+    request.setHeader(
+        'Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+
+class HardenedStaticFile(static.File):
+    def render(self, request):
+        _set_browser_security_headers(request)
+        return static.File.render(self, request)
+
 def _atomic_read(filename):
     try:
         with open(filename, 'rb') as f:
@@ -49,6 +63,7 @@ def get_web_root(wb, datadir_path, bitcoind_getinfo_var, stop_event=None, static
     stop_event = variable.Event() if stop_event is None else stop_event
     node = wb.node
     start_time = time.time()
+    pings_cache = dict(timestamp=0, result=None, in_flight=None)
     
     web_root = resource.Resource()
     
@@ -161,6 +176,7 @@ def get_web_root(wb, datadir_path, bitcoind_getinfo_var, stop_event=None, static
             ),
             miner_hash_rates=miner_hash_rates,
             miner_dead_hash_rates=miner_dead_hash_rates,
+            miner_last_seen_times=dict(wb.miner_last_seen_times.items()),
             miner_last_difficulties=miner_last_difficulties,
             efficiency_if_miner_perfect=(1 - stale_orphan_shares/shares)/(1 - global_stale_prop) if shares else None, # ignores dead shares because those are miner's fault and indicated by pseudoshare rejection
             efficiency=(1 - (stale_orphan_shares+stale_doa_shares)/shares)/(1 - global_stale_prop) if shares else None,
@@ -196,6 +212,7 @@ def get_web_root(wb, datadir_path, bitcoind_getinfo_var, stop_event=None, static
         
         @defer.inlineCallbacks
         def render_GET(self, request):
+            _set_browser_security_headers(request)
             request.setHeader('Content-Type', self.mime_type)
             request.setHeader('Access-Control-Allow-Origin', '*')
             res = yield self.func(*self.args)
@@ -219,16 +236,47 @@ def get_web_root(wb, datadir_path, bitcoind_getinfo_var, stop_event=None, static
     web_root.putChild(b'peer_addresses', WebInterface(lambda: ' '.join('%s%s' % (peer.transport.getPeer().host, ':'+str(peer.transport.getPeer().port) if peer.transport.getPeer().port != node.net.P2P_PORT else '') for peer in node.p2p_node.peers.values())))
     web_root.putChild(b'peer_txpool_sizes', WebInterface(lambda: dict(('%s:%i' % (peer.transport.getPeer().host, peer.transport.getPeer().port), peer.remembered_txs_size) for peer in node.p2p_node.peers.values())))
     @defer.inlineCallbacks
+    def get_peer_ping(peer):
+        measurements = []
+        for _ in range(3):
+            measurement = yield peer.do_ping().addCallback(
+                lambda x: x/0.001).addErrback(lambda fail: None)
+            if measurement is not None:
+                measurements.append(measurement)
+        defer.returnValue(min(measurements) if measurements else None)
+
+    @defer.inlineCallbacks
+    def refresh_pings():
+        peers = list(node.p2p_node.peers.values())
+        addresses = [
+            '%s:%i' % (peer.transport.getPeer().host,
+                peer.transport.getPeer().port)
+            for peer in peers]
+        results = yield defer.DeferredList(
+            [get_peer_ping(peer) for peer in peers], consumeErrors=True)
+        defer.returnValue(dict(
+            (address, value if succeeded else None)
+            for address, (succeeded, value) in zip(addresses, results)))
+
+    @defer.inlineCallbacks
     def get_pings():
-        res = {}
-        for peer in list(node.p2p_node.peers.values()):
-            addr = '%s:%i' % (peer.transport.getPeer().host, peer.transport.getPeer().port)
-            values = []
-            for _ in range(3):
-                value = yield peer.do_ping().addCallback(lambda x: x/0.001).addErrback(lambda fail: None)
-                values.append(value)
-            res[addr] = min(values)
-        defer.returnValue(res)
+        now = time.time()
+        if (pings_cache['result'] is not None and
+                now - pings_cache['timestamp'] < PINGS_CACHE_SECONDS):
+            defer.returnValue(pings_cache['result'])
+        if pings_cache['in_flight'] is None:
+            pings_cache['in_flight'] = refresh_pings()
+        current_refresh = pings_cache['in_flight']
+        try:
+            result = yield current_refresh
+        except Exception:
+            if pings_cache['in_flight'] is current_refresh:
+                pings_cache['in_flight'] = None
+            raise
+        if pings_cache['in_flight'] is current_refresh:
+            pings_cache.update(
+                timestamp=time.time(), result=result, in_flight=None)
+        defer.returnValue(result)
     web_root.putChild(b'pings', WebInterface(get_pings))
     web_root.putChild(b'peer_versions', WebInterface(lambda: dict(('%s:%i' % peer.addr, peer.other_sub_version) for peer in node.p2p_node.peers.values())))
     web_root.putChild(b'payout_addr', WebInterface(lambda: wb.address))
@@ -389,12 +437,15 @@ def get_web_root(wb, datadir_path, bitcoind_getinfo_var, stop_event=None, static
             hd_obj = json.loads(hd_data)
         except Exception:
             log.err(None, 'Error reading graph database:')
+    day = 60*60*24
     dataview_descriptions = {
         'last_hour': graph.DataViewDescription(150, 60*60),
-        'last_day': graph.DataViewDescription(300, 60*60*24),
-        'last_week': graph.DataViewDescription(300, 60*60*24*7),
-        'last_month': graph.DataViewDescription(300, 60*60*24*30),
-        'last_year': graph.DataViewDescription(300, 60*60*24*365.25),
+        'last_day': graph.DataViewDescription(300, day),
+        'last_week': graph.DataViewDescription(300, day*7),
+        'last_month': graph.DataViewDescription(300, day*30),
+        'last_year': graph.DataViewDescription(365, day*365),
+        'last_twenty_years': graph.DataViewDescription(
+            365*20 + 5, day*(365*20 + 5)),
     }
     hd = graph.HistoryDatabase.from_obj({
         'local_hash_rate': graph.DataStreamDescription(dataview_descriptions, is_gauge=False),
@@ -408,8 +459,8 @@ def get_web_root(wb, datadir_path, bitcoind_getinfo_var, stop_event=None, static
         'current_payout': graph.DataStreamDescription(dataview_descriptions),
         'current_payouts': graph.DataStreamDescription(dataview_descriptions, multivalues=True),
         'peers': graph.DataStreamDescription(dataview_descriptions, multivalues=True, default_func=graph.make_multivalue_migrator(dict(incoming='incoming_peers', outgoing='outgoing_peers'))),
-        'miner_hash_rates': graph.DataStreamDescription(dataview_descriptions, is_gauge=False, multivalues=True, multivalues_keep=10000),
-        'miner_dead_hash_rates': graph.DataStreamDescription(dataview_descriptions, is_gauge=False, multivalues=True, multivalues_keep=10000),
+        'miner_hash_rates': graph.DataStreamDescription(dataview_descriptions, is_gauge=False, multivalues=True, multivalues_keep=4096),
+        'miner_dead_hash_rates': graph.DataStreamDescription(dataview_descriptions, is_gauge=False, multivalues=True, multivalues_keep=4096),
         'desired_version_rates': graph.DataStreamDescription(dataview_descriptions, multivalues=True,
             multivalue_undefined_means_0=True),
         'traffic_rate': graph.DataStreamDescription(dataview_descriptions, is_gauge=False, multivalues=True),
@@ -505,6 +556,6 @@ def get_web_root(wb, datadir_path, bitcoind_getinfo_var, stop_event=None, static
             raise RuntimeError(
                 'No web-static frontend directory found. Checked: '
                 f'{", ".join(static_dir_candidates)}')
-    web_root.putChild(b'static', static.File(static_dir))
+    web_root.putChild(b'static', HardenedStaticFile(static_dir))
     
     return web_root

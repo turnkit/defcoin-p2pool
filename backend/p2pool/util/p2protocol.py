@@ -15,6 +15,9 @@ from p2pool.util.py3 import bytes_to_hex, ensure_bytes
 class TooLong(Exception):
     pass
 
+class StopReceiving(Exception):
+    pass
+
 class Protocol(protocol.Protocol):
     def __init__(self, message_prefix, max_payload_length, traffic_happened=None, ignore_trailing_payload=False):
         traffic_happened = variable.Event() if traffic_happened is None else traffic_happened
@@ -32,7 +35,10 @@ class Protocol(protocol.Protocol):
     
     def dataReceived(self, data):
         self.traffic_happened.happened('p2p/in', len(data))
-        self.dataReceived2(data)
+        try:
+            self.dataReceived2(data)
+        except StopReceiving:
+            self.dataReceived2 = lambda data: None
     
     def dataReceiver(self):
         while True:
@@ -45,11 +51,17 @@ class Protocol(protocol.Protocol):
                         break
             self._message_prefix = start
             
-            command = (yield 12).rstrip(b'\0').decode('ascii')
+            try:
+                command = (yield 12).rstrip(b'\0').decode('ascii')
+            except UnicodeDecodeError:
+                print('invalid non-ASCII command')
+                self.badPeerHappened()
+                raise StopReceiving()
             length, = struct.unpack('<I', (yield 4))
             if length > self._max_payload_length:
                 print('length too large')
-                continue
+                self.badPeerHappened()
+                raise StopReceiving()
             checksum = yield 4
             payload = yield length
             
@@ -58,7 +70,7 @@ class Protocol(protocol.Protocol):
                 if p2pool.DEBUG:
                     print(bytes_to_hex(hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]), bytes_to_hex(payload))
                 self.badPeerHappened()
-                continue
+                raise StopReceiving()
             
             type_ = getattr(self, 'message_' + command, None)
             if type_ is None:
@@ -72,6 +84,7 @@ class Protocol(protocol.Protocol):
                 print('RECV', command, bytes_to_hex(payload[:100]) + ('...' if len(payload) > 100 else ''))
                 log.err(None, 'Error handling message: (see RECV line)')
                 self.disconnect()
+                raise StopReceiving()
     
     def packetReceived(self, command, payload2):
         handler = getattr(self, 'handle_' + command, None)

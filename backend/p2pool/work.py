@@ -1,7 +1,8 @@
 
-from collections import deque
+from collections import OrderedDict, deque
 
 import base64
+import hashlib
 import random
 import re
 import secrets
@@ -13,14 +14,33 @@ from twisted.python import log
 
 from .bitcoin import getwork as bitcoin_getwork, data as bitcoin_data
 from .bitcoin import helper, script, worker_interface
-from .util import forest, jsonrpc, variable, deferral, math, pack
+from .util import expiring_dict, forest, jsonrpc, variable, deferral, math, pack
 from .util.py3 import bytes_to_hex, hex_to_bytes, ensure_bytes
 import p2pool, p2pool.data as p2pool_data
 
 print_throttle = 0.0
+MINER_LAST_SEEN_KEEP = 90*24*60*60
+MAX_MINER_IDENTITIES = 4096
+MAX_MINER_IDENTITY_LENGTH = 256
+MAX_RATE_DATUMS = 65536
+
+def miner_telemetry_identity(user):
+    """Return a bounded, log-safe identity without changing payout routing."""
+    if not isinstance(user, str):
+        return None
+    if (len(user) <= MAX_MINER_IDENTITY_LENGTH and user.isprintable() and
+            '\r' not in user and '\n' not in user):
+        return user
+    digest = hashlib.sha256(
+        user.encode('utf-8', errors='surrogatepass')).hexdigest()
+    return 'worker-sha256:' + digest
 
 class WorkerBridge(worker_interface.WorkerBridge):
     COINBASE_NONCE_LENGTH = 8
+
+    @staticmethod
+    def miner_telemetry_identity(user):
+        return miner_telemetry_identity(user)
     
     def __init__(self, node, my_address, donation_percentage, merged_urls,
                  worker_fee, args, pubkeys, bitcoind, share_rate):
@@ -41,13 +61,18 @@ class WorkerBridge(worker_interface.WorkerBridge):
         self.running = True
         self.pseudoshare_received = variable.Event()
         self.share_received = variable.Event()
-        self.local_rate_monitor = math.RateMonitor(10*60)
-        self.local_addr_rate_monitor = math.RateMonitor(10*60)
+        self.local_rate_monitor = math.RateMonitor(
+            10*60, max_len=MAX_RATE_DATUMS)
+        self.local_addr_rate_monitor = math.RateMonitor(
+            10*60, max_len=MAX_RATE_DATUMS)
+        self.miner_last_seen_times = expiring_dict.ExpiringDict(
+            MINER_LAST_SEEN_KEEP, get_touches=False,
+            max_len=MAX_MINER_IDENTITIES)
         
         self.removed_unstales_var = variable.Variable((0, 0, 0))
         self.removed_doa_unstales_var = variable.Variable(0)
         
-        self.last_work_shares = variable.Variable( {} )
+        self.last_work_shares = variable.Variable(OrderedDict())
         self.my_share_hashes = set()
         self.my_doa_share_hashes = set()
 
@@ -138,6 +163,15 @@ class WorkerBridge(worker_interface.WorkerBridge):
     
     def stop(self):
         self.running = False
+        self.miner_last_seen_times.stop()
+
+    def note_miner_seen(self, user, now=None):
+        user = miner_telemetry_identity(user)
+        if user is None:
+            return
+        if now is None:
+            now = time.time()
+        self.miner_last_seen_times[user] = now
     
     def get_stale_counts(self):
         '''Returns (orphans, doas), total, (orphans_recorded_in_chain, doas_recorded_in_chain)'''
@@ -245,22 +279,37 @@ class WorkerBridge(worker_interface.WorkerBridge):
         return None
     
     def get_local_rates(self):
-        miner_hash_rates = {}
-        miner_dead_hash_rates = {}
+        miner_hash_rates = OrderedDict()
+        miner_dead_hash_rates = OrderedDict()
         datums, dt = self.local_rate_monitor.get_datums_in_last()
+        if dt <= 0:
+            return {}, {}
         for datum in datums:
+            user = datum['user']
+            if user in miner_hash_rates:
+                miner_hash_rates.move_to_end(user)
+            elif len(miner_hash_rates) >= MAX_MINER_IDENTITIES:
+                evicted_user, _ = miner_hash_rates.popitem(last=False)
+                miner_dead_hash_rates.pop(evicted_user, None)
             miner_hash_rates[datum['user']] = miner_hash_rates.get(datum['user'], 0) + datum['work']/dt
             if datum['dead']:
                 miner_dead_hash_rates[datum['user']] = miner_dead_hash_rates.get(datum['user'], 0) + datum['work']/dt
-        return miner_hash_rates, miner_dead_hash_rates
+        return dict(miner_hash_rates), dict(miner_dead_hash_rates)
     
     def get_local_addr_rates(self):
-        addr_hash_rates = {}
+        addr_hash_rates = OrderedDict()
         datums, dt = self.local_addr_rate_monitor.get_datums_in_last()
+        if dt <= 0:
+            return {}
         for datum in datums:
-            addr_hash_rates[datum['address']] = \
-                    addr_hash_rates.get(datum['address'], 0) + datum['work']/dt
-        return addr_hash_rates
+            address = datum['address']
+            if address in addr_hash_rates:
+                addr_hash_rates.move_to_end(address)
+            elif len(addr_hash_rates) >= MAX_MINER_IDENTITIES:
+                addr_hash_rates.popitem(last=False)
+            addr_hash_rates[address] = \
+                    addr_hash_rates.get(address, 0) + datum['work']/dt
+        return dict(addr_hash_rates)
  
     def get_work(self, user, address, desired_share_target,
                  desired_pseudoshare_target, worker_ip=None):
@@ -424,7 +473,10 @@ class WorkerBridge(worker_interface.WorkerBridge):
                 print_throttle = time.time()
 
         #need this for stats
+        self.last_work_shares.value.pop(address, None)
         self.last_work_shares.value[address] = share_info['bits']
+        if len(self.last_work_shares.value) > MAX_MINER_IDENTITIES:
+            self.last_work_shares.value.popitem(last=False)
         
         ba = dict(
             version=max(self.current_work.value['version'], 0x20000000),
@@ -452,6 +504,8 @@ class WorkerBridge(worker_interface.WorkerBridge):
             
             header_hash = bitcoin_data.hash256(bitcoin_data.block_header_type.pack(header))
             pow_hash = self.node.net.PARENT.POW_FUNC(bitcoin_data.block_header_type.pack(header))
+            got_response.last_submission_met_share_target = \
+                pow_hash <= share_info['bits'].target
             try:
                 if pow_hash <= header['bits'].target or p2pool.DEBUG:
                     if pow_hash <= header['bits'].target:
@@ -463,6 +517,7 @@ class WorkerBridge(worker_interface.WorkerBridge):
                 log.err(None, 'Error while processing potential block:')
             
             username, _, _, _ = self.get_user_details(username)
+            telemetry_username = miner_telemetry_identity(username)
             assert header['previous_block'] == ba['previous_block']
             assert header['merkle_root'] == bitcoin_data.check_merkle_link(bitcoin_data.hash256(new_packed_gentx), merkle_link)
             assert header['bits'] == ba['bits']
@@ -501,7 +556,7 @@ class WorkerBridge(worker_interface.WorkerBridge):
                 share = get_share(header, last_txout_nonce)
                 
                 print('GOT SHARE! %s %s prev %s age %.2fs%s' % (
-                    username,
+                    telemetry_username,
                     p2pool_data.format_hash(share.hash),
                     p2pool_data.format_hash(share.previous_hash),
                     time.time() - getwork_time,
@@ -542,24 +597,27 @@ class WorkerBridge(worker_interface.WorkerBridge):
                 self.share_received.happened(bitcoin_data.target_to_average_attempts(share.target), not on_time, share.hash)
 
             if pow_hash > pseudoshare_target:
-                print('Worker %s submitted share with hash > target:' % (username,))
+                print('Worker %s submitted share with hash > target:' % (telemetry_username,))
                 print('    Hash:   %064x' % (pow_hash,))
                 print('    Target: %064x' % (pseudoshare_target,))
             elif header_hash in received_header_hashes:
-                print('Worker %s submitted share more than once!' % (username,), file=sys.stderr)
+                print('Worker %s submitted share more than once!' % (telemetry_username,), file=sys.stderr)
             else:
                 received_header_hashes.add(header_hash)
                 
-                self.pseudoshare_received.happened(bitcoin_data.target_to_average_attempts(pseudoshare_target), not on_time, username)
-                self.recent_shares_ts_work.append((time.time(), bitcoin_data.target_to_average_attempts(pseudoshare_target)))
+                now = time.time()
+                self.note_miner_seen(telemetry_username, now)
+                self.pseudoshare_received.happened(bitcoin_data.target_to_average_attempts(pseudoshare_target), not on_time, telemetry_username)
+                self.recent_shares_ts_work.append((now, bitcoin_data.target_to_average_attempts(pseudoshare_target)))
                 while len(self.recent_shares_ts_work) > 50:
                     self.recent_shares_ts_work.pop(0)
-                self.local_rate_monitor.add_datum(dict(work=bitcoin_data.target_to_average_attempts(pseudoshare_target), dead=not on_time, user=username, share_target=share_info['bits'].target))
+                self.local_rate_monitor.add_datum(dict(work=bitcoin_data.target_to_average_attempts(pseudoshare_target), dead=not on_time, user=telemetry_username, share_target=share_info['bits'].target))
                 self.local_addr_rate_monitor.add_datum(dict(work=bitcoin_data.target_to_average_attempts(pseudoshare_target), address=address))
             t1 = time.time()
-            if p2pool.BENCH and (t1-t0) > .01: print("%8.3f ms for work.py:got_response(%s)" % ((t1-t0)*1000., username))
+            if p2pool.BENCH and (t1-t0) > .01: print("%8.3f ms for work.py:got_response(%s)" % ((t1-t0)*1000., telemetry_username))
 
             return on_time
+        got_response.last_submission_met_share_target = False
         t1 = time.time()
         if p2pool.BENCH: print("%8.3f ms for work.py:get_work(%s, %s)" % ((t1-t0)*1000., user, address))
         return ba, got_response

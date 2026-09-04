@@ -10,8 +10,8 @@
     <title>DC903 - node stats</title>
 
     <!-- Bootstrap core CSS -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@3.4.1/dist/css/bootstrap.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@3.4.1/dist/css/bootstrap.min.css" integrity="sha384-HSMxcRTRxnN+Bdg0JdbxYKrThecOKuH5zCYotlSAcp1+c8xmyTe9GYg1l9a69psu" crossorigin="anonymous">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css" integrity="sha384-wvfXpqpZZVQGK6TAh5PVlGOfQNHSoD2xbE+QkPxCAFlNEevoEH3Sl0sibVcOQVnN" crossorigin="anonymous">
     <link rel="stylesheet" href="css/bootstrap-sortable.css">
     <link id="theme" rel="stylesheet" href="#">
 
@@ -83,11 +83,13 @@
                 <th class="text-left">Address</th>
                 <th class="text-right">Hashrate</th>
                 <th class="text-right">Rejected Hashrate</th>
+                <th class="text-right" title="Time since this node last saw a valid share submission from this miner. Values under 24 hours show 00h02m53s style, then whole Day/Days. Sorting uses exact seconds.">Share Age</th>
                 <th class="text-right">Predicted Payout</th>
               </tr>
             </thead>
           </table>
         </div>
+        <p class="text-muted small">Share Age is based on the last valid share submission this node saw from that miner. Values under 24 hours show 00h02m53s style, then whole Day/Days; sorting uses exact seconds.</p>
       </section>
 
       <section class="panel panel-default clearfix">
@@ -187,6 +189,7 @@
                 <button id="week" type="button" class="hashrate btn btn-info">Week</button>
                 <button id="month" type="button" class="hashrate btn btn-info">Month</button>
                 <button id="year" type="button" class="hashrate btn btn-info">Year</button>
+                <button id="twenty_years" type="button" class="hashrate btn btn-info">20 Years</button>
               </div>
               <div id="chart"></div>
             </div>
@@ -298,14 +301,13 @@
       </div>
     </footer>
 
-    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-    <script src="js/jquery-dateFormat.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@3.4.1/dist/js/bootstrap.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.30.1/moment.min.js"></script>
-    <script src="js/bootstrap-sortable.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha384-1H217gwSVyLSIfaLxHbE7dRb3v4mYCKbpQvzx0cegeju1MVsGrX5xXxAvs/HgeFs" crossorigin="anonymous"></script>
+    <script src="js/jquery-dateFormat.min.js" integrity="sha384-b5m6EV3lKp8xtfaxnhtzbB1yrDl1psga4SGPLc1jIcUQFp6HVF71cRS04axRLwVO"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@3.4.1/dist/js/bootstrap.min.js" integrity="sha384-aJ21OjlMXNL5UyIl/XNwTMqvzeRMZH2w8c5cRVpzpU8Y5bApTppSuUkhZXN0VxHd" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.30.1/moment.min.js" integrity="sha384-KIix3a0qkeD2RPwPvpkJ+Knc91vkmDI+i2c7phIO+EfV3dpfDXIGSqQjpIaJXlR9" crossorigin="anonymous"></script>
+    <script src="js/bootstrap-sortable.js" integrity="sha384-lnL0kq0lbSQZXp2mCVuklz38XwehdwoUeiv0hvIruA+OMRxVB1ivh11eJGRwER1g"></script>
 
-    <script src="js/highcharts.js"></script>
-    <script src="js/exporting.js"></script>
+    <script src="js/highcharts.js" integrity="sha384-SGSvmfhCM3hkGxTFp+XUzegWFyvDjY5Fp8XAwYgjU9m/ABGDZP155lxJcur+S8cc"></script>
 
     <script src="js/util.js"></script>
     <script src="js/charts.js"></script>

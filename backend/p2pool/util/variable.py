@@ -48,36 +48,37 @@ class Event(object):
     
     def get_deferred(self, timeout=None):
         once = self.once
-        watch_ids = []
-        delay = [None]
+        state = dict(watch_id=None, delay=None)
+
+        def cleanup():
+            if state['watch_id'] is not None:
+                once.observers.pop(state['watch_id'], None)
+                state['watch_id'] = None
+            if state['delay'] is not None:
+                if state['delay'].active():
+                    state['delay'].cancel()
+                state['delay'] = None
 
         def cancel(df):
-            for watch_id in watch_ids[:]:
-                if watch_id in once.observers:
-                    once.unwatch(watch_id)
-            if delay[0] is not None and delay[0].active():
-                delay[0].cancel()
+            cleanup()
 
         df = defer.Deferred(cancel)
 
-        def callback_once(*event):
+        def happened(*event):
+            cleanup()
             if not df.called:
                 df.callback(event)
 
-        id1 = once.watch(callback_once)
-        watch_ids.append(id1)
+        state['watch_id'] = once.watch(happened)
         if timeout is not None:
             def do_timeout():
+                state['delay'] = None
+                if state['watch_id'] is not None:
+                    once.observers.pop(state['watch_id'], None)
+                    state['watch_id'] = None
                 if not df.called:
                     df.errback(failure.Failure(defer.TimeoutError('in Event.get_deferred')))
-            delay[0] = reactor.callLater(timeout, do_timeout)
-
-            def cancel_timeout(*event):
-                if delay[0] is not None and delay[0].active():
-                    delay[0].cancel()
-
-            x = once.watch(cancel_timeout)
-            watch_ids.append(x)
+            state['delay'] = reactor.callLater(timeout, do_timeout)
         return df
 
 class Variable(object):

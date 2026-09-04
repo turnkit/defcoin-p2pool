@@ -16,6 +16,10 @@ from p2pool.bitcoin import data as bitcoin_data, script, sha256
 from p2pool.util import math, forest, pack
 from p2pool.util.py3 import bord, bytes_to_hex, hex_to_bytes, ensure_bytes
 
+MAX_SHARE_TRANSACTION_HASHES = 65536
+MAX_SHARE_TRANSACTION_HASH_REFS = 2*MAX_SHARE_TRANSACTION_HASHES
+MAX_SHARE_MERKLE_BRANCH = 64
+
 def parse_bip0034(coinbase):
     _, opdata = next(script.parse(coinbase))
     bignum = pack.IntType(len(opdata)*8).unpack(opdata)
@@ -133,7 +137,9 @@ class BaseShare(object):
         t = dict(share_info_type=None, share_type=None, ref_type=None)
         segwit_data = ('segwit_data', pack.PossiblyNoneType(dict(txid_merkle_link=dict(branch=[], index=0), wtxid_merkle_root=2**256-1), pack.ComposedType([
             ('txid_merkle_link', pack.ComposedType([
-                ('branch', pack.ListType(pack.IntType(256))),
+                ('branch', pack.ListType(
+                    pack.IntType(256),
+                    max_count=MAX_SHARE_MERKLE_BRANCH)),
                 ('index', pack.IntType(0)), # it will always be 0
             ])),
             ('wtxid_merkle_root', pack.IntType(256))
@@ -151,8 +157,12 @@ class BaseShare(object):
                 ('stale_info', pack.EnumType(pack.IntType(8), dict((k, {0: None, 253: 'orphan', 254: 'doa'}.get(k, 'unk%i' % (k,))) for k in range(256)))),
                 ('desired_version', pack.VarIntType()),
             ]))] + ([segwit_data] if is_segwit_activated(cls.VERSION, net) else []) + ([
-            ('new_transaction_hashes', pack.ListType(pack.IntType(256))),
-            ('transaction_hash_refs', pack.ListType(pack.VarIntType(), 2)), # pairs of share_count, tx_count
+            ('new_transaction_hashes', pack.ListType(
+                pack.IntType(256),
+                max_count=MAX_SHARE_TRANSACTION_HASHES)),
+            ('transaction_hash_refs', pack.ListType(
+                pack.VarIntType(), 2,
+                max_count=MAX_SHARE_TRANSACTION_HASH_REFS)), # pairs of share_count, tx_count
             ] if cls.VERSION < 34 else []) + [
             ('far_share_hash', pack.PossiblyNoneType(0, pack.IntType(256))),
             ('max_bits', bitcoin_data.FloatingIntegerType()),
@@ -165,13 +175,17 @@ class BaseShare(object):
             ('min_header', cls.small_block_header_type),
             ('share_info', t['share_info_type']),
             ('ref_merkle_link', pack.ComposedType([
-                ('branch', pack.ListType(pack.IntType(256))),
+                ('branch', pack.ListType(
+                    pack.IntType(256),
+                    max_count=MAX_SHARE_MERKLE_BRANCH)),
                 ('index', pack.IntType(0)),
             ])),
             ('last_txout_nonce', pack.IntType(64)),
             ('hash_link', hash_link_type),
             ('merkle_link', pack.ComposedType([
-                ('branch', pack.ListType(pack.IntType(256))),
+                ('branch', pack.ListType(
+                    pack.IntType(256),
+                    max_count=MAX_SHARE_MERKLE_BRANCH)),
                 ('index', pack.IntType(0)), # it will always be 0
             ])),
         ])

@@ -14,12 +14,44 @@ class EarlyEnd(Exception):
 class LateEnd(Exception):
     pass
 
+MAX_LIST_ITEMS = 1000000
+MAX_DECODE_LIST_ITEMS = 1000000
+
+
+class _DecodeBudgetReader(object):
+    """Delegate to a byte stream while bounding cumulative list expansion."""
+    __slots__ = 'inner list_items_remaining'.split(' ')
+
+    def __init__(self, inner, list_items_remaining):
+        self.inner = inner
+        self.list_items_remaining = list_items_remaining
+
+    def consume_list_items(self, count):
+        if count < 0 or count > self.list_items_remaining:
+            raise ValueError('cumulative decoded list item count too large')
+        self.list_items_remaining -= count
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def consume_list_items(file, count):
+    consume = getattr(file, 'consume_list_items', None)
+    if consume is not None:
+        consume(count)
+
 def remaining(sio):
     here = sio.tell()
     sio.seek(0, os.SEEK_END)
     end  = sio.tell()
     sio.seek(here)
     return end - here
+
+def read_exact(file, length):
+    data = file.read(length)
+    if len(data) != length:
+        raise EarlyEnd()
+    return data
 
 class Type(object):
     __slots__ = []
@@ -52,8 +84,10 @@ class Type(object):
         return f.getvalue()
     
     def unpack(self, data, ignore_trailing=False):
-        if not hasattr(data, 'read'):
-            data = io.BytesIO(ensure_bytes(data))
+        if not isinstance(data, _DecodeBudgetReader):
+            if not hasattr(data, 'read'):
+                data = io.BytesIO(ensure_bytes(data))
+            data = _DecodeBudgetReader(data, MAX_DECODE_LIST_ITEMS)
         obj = self._unpack(data, ignore_trailing)
         
         if p2pool.DEBUG:
@@ -83,9 +117,7 @@ class Type(object):
 
 class VarIntType(Type):
     def read(self, file):
-        data = file.read(1)
-        if not data:
-            raise EarlyEnd()
+        data = read_exact(file, 1)
         first = bord(data)
         if first < 0xfd:
             return first
@@ -97,7 +129,7 @@ class VarIntType(Type):
             desc, length, minimum = '<Q', 8, 2**32
         else:
             raise AssertionError()
-        data2 = file.read(length)
+        data2 = read_exact(file, length)
         res, = struct.unpack(desc, data2)
         if res < minimum:
             raise AssertionError('VarInt not canonically packed')
@@ -120,7 +152,7 @@ class VarStrType(Type):
     
     def read(self, file):
         length = self._inner_size.read(file)
-        return file.read(length)
+        return read_exact(file, length)
     
     def write(self, file, item):
         self._inner_size.write(file, len(item))
@@ -151,18 +183,24 @@ class EnumType(Type):
 class ListType(Type):
     _inner_size = VarIntType()
     
-    def __init__(self, type, mul=1):
+    def __init__(self, type, mul=1, max_count=MAX_LIST_ITEMS):
         self.type = type
         self.mul = mul
+        self.max_count = max_count
     
     def read(self, file):
         length = self._inner_size.read(file)
         length *= self.mul
+        if self.max_count is not None and length > self.max_count:
+            raise ValueError('list item count too large')
+        consume_list_items(file, length)
         res = [self.type.read(file) for i in range(length)]
         return res
     
     def write(self, file, item):
         assert len(item) % self.mul == 0
+        if self.max_count is not None and len(item) > self.max_count:
+            raise ValueError('list item count too large')
         self._inner_size.write(file, len(item)//self.mul)
         for subitem in item:
             self.type.write(file, subitem)
@@ -175,7 +213,7 @@ class StructType(Type):
         self.length = struct.calcsize(self.desc)
     
     def read(self, file):
-        data = file.read(self.length)
+        data = read_exact(file, self.length)
         return struct.unpack(self.desc, data)[0]
     
     def write(self, file, item):
@@ -204,7 +242,7 @@ class IntType(Type):
     def read(self, file, b2a_hex=binascii.b2a_hex):
         if self.bytes == 0:
             return 0
-        data = file.read(self.bytes)
+        data = read_exact(file, self.bytes)
         return int(b2a_hex(data[::self.step]), 16)
     
     def write(self, file, item, a2b_hex=binascii.a2b_hex):
@@ -216,7 +254,7 @@ class IntType(Type):
 
 class IPV6AddressType(Type):
     def read(self, file):
-        data = file.read(16)
+        data = read_exact(file, 16)
         if data[:12] == hex_to_bytes('00000000000000000000ffff'):
             return '.'.join(str(x) for x in data[12:])
         return ':'.join(bytes_to_hex(data[i*2:(i+1)*2]) for i in range(8))
@@ -306,7 +344,7 @@ class FixedStrType(Type):
         self.length = length
     
     def read(self, file):
-        return file.read(self.length)
+        return read_exact(file, self.length)
     
     def write(self, file, item):
         if len(item) != self.length:
